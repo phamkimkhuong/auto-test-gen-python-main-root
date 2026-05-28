@@ -1,0 +1,57 @@
+[run]
+# Measure branch coverage instead of just statement coverage
+branch = True
+
+# Omit these patterns from coverage measurement
+omit =
+    # Test files
+    tests/*
+    test_*.py
+    *_test.py
+    conftest.py
+    
+    # Virtual environments
+    .venv/*
+    venv/*
+    env/*
+    */site-packages/*
+    
+    # Generated files and reports
+    htmlcov/*
+    allure-results/*
+    tests_output/*
+    test_output_buggy/*
+    .coverage
+    *.egg-info/*
+    build/*
+    dist/*
+    
+    # IDE and system files
+    .idea/*
+    .vscode/*
+    __pycache__/*
+    *.pyc
+    .pytest_cache/*
+    .git/*
+
+[report]
+# Don't report missing lines in imported modules
+ignore_errors = False
+
+# Precision for coverage percentages
+precision = 2
+
+# Skip empty files
+skip_empty = True
+
+[html]
+# Output directory for HTML coverage report
+directory = htmlcov
+
+[xml]
+# Output file for XML coverage report
+output = coverage.xml
+
+[json]
+# Output file for JSON coverage report
+output = coverage.json

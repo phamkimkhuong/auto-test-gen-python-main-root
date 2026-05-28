@@ -1,0 +1,30 @@
+# Python Caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Coverage reports
+.coverage
+coverage.xml
+htmlcov/
+
+# Local Environment
+.venv/
+venv/
+ENV/
+
+# Project Specific
+tests_output/
+*.log
+.DS_Store
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+report_data.json
+test_dashboard.html
