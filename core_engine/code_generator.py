@@ -16,13 +16,12 @@ from __future__ import annotations
 
 import ast
 import builtins
-import itertools
 import math
 import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from .ast_parser import parse_file
-from .heuristics import build_arg_strategy
+from .whitebox_planner import plan_whitebox_cases
 
 _BUILTIN_EXCEPTIONS = {
     name
@@ -36,58 +35,6 @@ _EMPTY_VALUES = [None, "", [], {}]
 # ============================================================================
 # SORTING & DETERMINISTIC ORDERING
 # ============================================================================
-
-def _dedupe(values: Iterable[Any]) -> List[Any]:
-    """Remove duplicates while preserving order; supports unhashable values."""
-    out: List[Any] = []
-    for value in values:
-        if not any(value == existing for existing in out):
-            out.append(value)
-    return out
-
-
-def _sort_values(values: List[Any]) -> List[Any]:
-    """Sort values deterministically, handling nested lists and mixed types."""
-    if not values:
-        return []
-
-    has_none = any(value is None for value in values)
-    non_none = [value for value in values if value is not None]
-    if not non_none:
-        return [None] if has_none else []
-
-    deduped = _dedupe(non_none)
-
-    try:
-        if all(isinstance(v, bool) for v in deduped):
-            sorted_vals = sorted(deduped)
-        elif all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in deduped):
-            sorted_vals = sorted(deduped)
-        elif all(isinstance(v, str) for v in deduped):
-            sorted_vals = sorted(deduped, key=lambda s: (len(s), s))
-        elif all(isinstance(v, (list, tuple, set)) for v in deduped):
-            sorted_vals = sorted(deduped, key=lambda x: (len(x), repr(x)))
-        elif all(isinstance(v, dict) for v in deduped):
-            sorted_vals = sorted(deduped, key=lambda x: (len(x), repr(x)))
-        else:
-            sorted_vals = sorted(deduped, key=lambda x: (type(x).__name__, repr(x)))
-    except Exception:
-        sorted_vals = deduped
-
-    return ([None] if has_none else []) + sorted_vals
-
-
-def _unique_tuples(tuples_: List[List[Any]]) -> List[List[Any]]:
-    """Deduplicate list-based test tuples using repr as a stable key."""
-    seen = set()
-    out: List[List[Any]] = []
-    for item in tuples_:
-        key = repr(item)
-        if key not in seen:
-            seen.add(key)
-            out.append(item)
-    return out
-
 
 def _unique_names(names: Sequence[str]) -> List[str]:
     """Deduplicate import names while preserving order."""
@@ -342,25 +289,31 @@ def _needs_instance(target: Dict[str, Any]) -> bool:
     return method_kind in {"instance", "property", None}
 
 
-def _constructor_smoke_values(cls: Dict[str, Any]) -> List[Any]:
+def _constructor_statement_values(cls: Dict[str, Any]) -> List[Any]:
+    """Return one safe constructor tuple for instance method setup."""
     constructor = cls.get("constructor") or {}
     args = constructor.get("args") or []
     if not args:
         return []
-    bundle = _build_safe_cases(
+
+    plan = plan_whitebox_cases(
+        constructor,
         args,
-        constructor.get("branches", []),
         constructor.get("try_except_blocks", []),
-        limit=1,
     )
-    return list(bundle.get("smoke", []))
+    cases = (
+        plan.get("statement_cases")
+        or plan.get("branch_cases")
+        or []
+    )
+    return list(cases[0]) if cases else []
 
 
 def _constructor_expression(cls: Dict[str, Any]) -> str:
     class_name = cls["class_name"]
     constructor = cls.get("constructor") or {}
     args = constructor.get("args") or []
-    values = _constructor_smoke_values(cls)
+    values = _constructor_statement_values(cls)
     if not args:
         return f"{class_name}()"
 
@@ -377,110 +330,8 @@ def _constructor_expression(cls: Dict[str, Any]) -> str:
 
 
 # ============================================================================
-# STRATEGY BUILDERS
+# EXCEPTION INFERENCE
 # ============================================================================
-
-def _build_safe_cases(
-    args: List[Dict[str, Any]],
-    branches: List[Dict[str, Any]],
-    try_except_blocks: List[Dict[str, Any]] | None = None,
-    limit: int = 8,
-) -> Dict[str, Any]:
-    """Build smoke and boundary cases from heuristic strategies."""
-    if try_except_blocks is None:
-        try_except_blocks = []
-
-    strategies = [build_arg_strategy(arg, branches, try_except_blocks) for arg in args]
-    smoke = [strategy["smoke"] for strategy in strategies]
-
-    # Scale max candidate slicing dynamically based on argument count to prevent explosion
-    num_args = len(args)
-    if num_args <= 1:
-        max_per_arg = 100
-    elif num_args == 2:
-        max_per_arg = 25
-    else:
-        max_per_arg = 8
-
-    safe_lists = [strategy["safe"][:max_per_arg] if strategy["safe"] else [None] for strategy in strategies]
-    candidates = _unique_tuples([list(combo) for combo in itertools.product(*safe_lists)])
-    if smoke not in candidates:
-        candidates.insert(0, smoke)
-
-    try:
-        candidates = _sort_values(candidates)
-    except Exception:
-        pass
-
-    # Find candidates that cover each branch
-    branch_covering_cases: List[Any] = []
-    from .assertion_inference import evaluate_condition
-    for branch in branches:
-        cond = branch.get("condition") or {}
-        for combo in candidates:
-            input_values = {}
-            for arg_spec, val in zip(args, combo):
-                input_values[arg_spec.get("name", "")] = val
-            try:
-                if evaluate_condition(cond, input_values):
-                    if combo not in branch_covering_cases:
-                        branch_covering_cases.append(combo)
-                    break
-            except Exception:
-                pass
-
-    # Find fallback/default candidates (that match none of the branches)
-    fallback_cases: List[Any] = []
-    for combo in candidates:
-        matched_any = False
-        for branch in branches:
-            cond = branch.get("condition") or {}
-            input_values = {}
-            for arg_spec, val in zip(args, combo):
-                input_values[arg_spec.get("name", "")] = val
-            try:
-                if evaluate_condition(cond, input_values):
-                    matched_any = True
-                    break
-            except Exception:
-                pass
-        if not matched_any:
-            if combo not in fallback_cases:
-                fallback_cases.append(combo)
-            if len(fallback_cases) >= 2:
-                break
-
-    # Prioritize candidates according to selection logic
-    prioritized: List[Any] = []
-    if smoke not in prioritized:
-        prioritized.append(smoke)
-
-    for case in branch_covering_cases:
-        if case not in prioritized:
-            prioritized.append(case)
-
-    for case in fallback_cases:
-        if case not in prioritized:
-            prioritized.append(case)
-
-    # Fill remaining spots from sorted candidates
-    for combo in candidates:
-        if combo not in prioritized:
-            prioritized.append(combo)
-
-    # Ensure limit is dynamic to accommodate all branch-covering plus fallback cases
-    min_required = len(branch_covering_cases) + len(fallback_cases)
-    if smoke not in branch_covering_cases and smoke not in fallback_cases:
-        min_required += 1
-
-    actual_limit = max(limit, min_required)
-
-    return {
-        "strategies": strategies,
-        "smoke": smoke,
-        "boundary": prioritized[:actual_limit],
-    }
-
 
 def _infer_exception_name(func: Dict[str, Any]) -> Optional[str]:
     """Infer a builtin exception type that generated tests can catch safely."""
@@ -507,67 +358,6 @@ def _infer_exception_name(func: Dict[str, Any]) -> Optional[str]:
         return unique_try_types[0]
 
     return None
-
-
-def _branch_target_names(branch: Dict[str, Any]) -> List[str]:
-    """Extract target parameter names from new constraints or legacy fields."""
-    names: List[str] = []
-    for constraint in branch.get("constraints", []) or []:
-        for key in ("arg", "base_arg"):
-            value = constraint.get(key)
-            if isinstance(value, str) and value not in names:
-                names.append(value)
-    legacy = branch.get("arg")
-    if isinstance(legacy, str) and legacy not in names:
-        names.append(legacy)
-    return names
-
-
-def _build_raise_cases(
-    args: List[Dict[str, Any]],
-    func: Dict[str, Any],
-    safe_smoke: List[Any],
-    try_except_blocks: List[Dict[str, Any]] | None = None,
-) -> List[List[Any]]:
-    """Build cases that are expected to raise exceptions."""
-    if try_except_blocks is None:
-        try_except_blocks = []
-
-    if func.get("unconditional_raise"):
-        return [list(safe_smoke)]
-
-    strategies = [build_arg_strategy(arg, func.get("branches", []), try_except_blocks) for arg in args]
-    strategies_by_name = {spec["name"]: strategy for spec, strategy in zip(args, strategies)}
-    index_by_name = {spec["name"]: index for index, spec in enumerate(args)}
-    cases: List[List[Any]] = []
-
-    # Conditional raise branches. New parser constraints are preferred; legacy
-    # branch["arg"] remains supported.
-    for branch in func.get("branches", []):
-        if branch.get("raise_when") not in {"truthy", "falsy"}:
-            continue
-        for target in _branch_target_names(branch):
-            strategy = strategies_by_name.get(target)
-            index = index_by_name.get(target)
-            if strategy is None or index is None:
-                continue
-            for raise_value in strategy.get("raise", []):
-                values = list(safe_smoke)
-                values[index] = raise_value
-                cases.append(values)
-
-    # Try/except trigger values gathered by heuristics.
-    for target, strategy in strategies_by_name.items():
-        index = index_by_name.get(target)
-        if index is None:
-            continue
-        for raise_value in strategy.get("raise", []):
-            values = list(safe_smoke)
-            values[index] = raise_value
-            cases.append(values)
-
-    unique_cases = _unique_tuples(cases)
-    return _sort_values(unique_cases) if len(unique_cases) > 1 else unique_cases
 
 
 # ============================================================================
@@ -644,7 +434,7 @@ def _emit_assertion_for_plan(
         else:
             lines.append(f"{indent}assert {result_var} is None")
     else:
-        lines.append(f"{indent}# Assertion strength: 0 (Smoke test)")
+        lines.append(f"{indent}# Assertion strength: 0 (Execution-only fallback)")
         lines.append(f"{indent}# Execution-only test: no reliable assertion could be inferred.")
 
 
@@ -660,6 +450,219 @@ def _emit_value_assignments(lines: List[str], args: List[Dict[str, Any]], values
     for spec, value in zip(args, values):
         lines.append(f"    {spec['name']} = {_serialize_value(value)}")
 
+
+
+# ============================================================================
+# WHITE-BOX EMISSION HELPERS
+# ============================================================================
+
+def _record_assertion_stats(plan: Dict[str, Any], count: int = 1) -> Tuple[int, int, int, int]:
+    """Return assertion counters for one inferred assertion plan."""
+    level = int(plan.get("strength_level", 0) or 0)
+    if level in {2, 4}:
+        return count, 0, 0, 0
+    if level == 3:
+        return 0, count, 0, 0
+    if level == 1:
+        return 0, 0, count, 0
+    return 0, 0, 0, count
+
+
+def _cases_with_expected(
+    func: Dict[str, Any],
+    cases: List[List[Any]],
+) -> Tuple[List[Dict[str, Any]], bool, List[List[Any]]]:
+    """Build assertion plans and optional expected-value parameter cases."""
+    from .assertion_inference import infer_assertion_plan
+
+    plans = [infer_assertion_plan(func, case) for case in cases]
+    can_parametrize_expected = bool(cases) and all(
+        plan.get("kind") == "exact" and plan.get("strength_level") in {2, 4}
+        for plan in plans
+    )
+    if not can_parametrize_expected:
+        return plans, False, []
+
+    extended_cases: List[List[Any]] = []
+    for case, plan in zip(cases, plans):
+        try:
+            raw_expected = ast.literal_eval(plan["expected"])
+        except Exception:
+            raw_expected = plan["expected"]
+        extended_cases.append(list(case) + [raw_expected])
+    return plans, True, extended_cases
+
+
+def _emit_normal_coverage_test(
+    lines: List[str],
+    *,
+    target: Dict[str, Any],
+    func: Dict[str, Any],
+    args: List[Dict[str, Any]],
+    cases: List[List[Any]],
+    suffix: str,
+    title: str,
+    docstring: str,
+    call_expr: str,
+    obj_var: Optional[str],
+    is_async: bool,
+    def_prefix: str,
+    use_allure: bool,
+    fallback_assertion: Optional[str],
+) -> Tuple[int, int, int, int, int]:
+    """
+    Emit a statement/branch coverage test and return counters:
+    (generated_tests, exact_assertions, expression_assertions, type_assertions, weak_assertions)
+    """
+    if not cases:
+        return 0, 0, 0, 0, 0
+
+    arg_names = [arg["name"] for arg in args]
+    display_name = _target_display_name(target)
+    plans, can_parametrize_expected, expected_cases = _cases_with_expected(func, cases)
+
+    if args and len(cases) > 1:
+        case_ids = [_case_id(args, case) for case in cases]
+        if can_parametrize_expected:
+            extended_arg_names = arg_names + ["expected"]
+            extended_param_names = ", ".join(extended_arg_names)
+            lines.extend(_generate_parametrize_decorator(extended_arg_names, expected_cases, case_ids))
+            _extend_decorators(lines, is_async=is_async, use_allure=use_allure, title=title)
+            lines.append(f"{def_prefix} {_target_test_name(target, suffix)}({extended_param_names}):")
+            lines.append(f'    """{docstring}"""')
+            _emit_instance_setup(lines, target, obj_var)
+            _emit_input_data(lines, args)
+            if use_allure:
+                _emit_allure_attach(lines, "input_data", "Input")
+            _emit_execute_call(
+                lines,
+                call_expr=call_expr,
+                is_async=is_async,
+                use_allure=use_allure,
+                display_name=display_name,
+            )
+            max_strength = max(int(plan.get("strength_level", 0) or 0) for plan in plans)
+            desc = "Branch/path assertion" if max_strength == 4 else "Literal assertion"
+            lines.append(f"    # Assertion strength: {max_strength} ({desc})")
+            lines.append("    assert result == expected")
+            if use_allure:
+                _emit_allure_attach(lines, "result", "Output")
+            lines.append("")
+            return len(cases), len(cases), 0, 0, 0
+
+        lines.extend(_generate_parametrize_decorator(arg_names, cases, case_ids))
+        _extend_decorators(lines, is_async=is_async, use_allure=use_allure, title=title)
+        lines.append(f"{def_prefix} {_target_test_name(target, suffix)}({', '.join(arg_names)}):")
+        lines.append(f'    """{docstring}"""')
+        _emit_instance_setup(lines, target, obj_var)
+        _emit_input_data(lines, args)
+        if use_allure:
+            _emit_allure_attach(lines, "input_data", "Input")
+        _emit_execute_call(
+            lines,
+            call_expr=call_expr,
+            is_async=is_async,
+            use_allure=use_allure,
+            display_name=display_name,
+        )
+
+        level_3_plans = [plan for plan in plans if plan.get("strength_level") == 3]
+        if len(level_3_plans) == len(plans) and len({plan.get("expected") for plan in plans}) == 1:
+            plan = plans[0]
+            lines.append(f"    {plan['comment']}")
+            lines.append(f"    assert result == {plan['expected']}")
+            if use_allure:
+                _emit_allure_attach(lines, "result", "Output")
+            lines.append("")
+            return len(cases), 0, len(cases), 0, 0
+
+        _emit_result_assertion(lines, fallback_assertion, use_allure=use_allure)
+        if use_allure:
+            _emit_allure_attach(lines, "result", "Output")
+        lines.append("")
+
+        if not fallback_assertion:
+            return len(cases), 0, 0, 0, len(cases)
+        if "isinstance(" in fallback_assertion or " is None" in fallback_assertion:
+            return len(cases), 0, 0, len(cases), 0
+        if "==" in fallback_assertion:
+            return len(cases), len(cases), 0, 0, 0
+        return len(cases), 0, 0, 0, len(cases)
+
+    # Single case or no-argument case: emit a compact plain test function.
+    case = cases[0]
+    plan = plans[0] if plans else None
+    _extend_decorators(lines, is_async=is_async, use_allure=use_allure, title=title)
+    lines.append(f"{def_prefix} {_target_test_name(target, suffix)}():")
+    lines.append(f'    """{docstring}"""')
+    _emit_instance_setup(lines, target, obj_var)
+    if args:
+        _emit_value_assignments(lines, args, case)
+        _emit_input_data(lines, args)
+        if use_allure:
+            _emit_allure_attach(lines, "input_data", "Input")
+    _emit_execute_call(
+        lines,
+        call_expr=call_expr,
+        is_async=is_async,
+        use_allure=use_allure,
+        display_name=display_name,
+    )
+    if plan:
+        _emit_assertion_for_plan(lines, plan, use_allure=use_allure)
+        ex, expr, typ, weak = _record_assertion_stats(plan, 1)
+    else:
+        _emit_result_assertion(lines, fallback_assertion, use_allure=use_allure)
+        ex, expr, typ, weak = (0, 0, 0, 1)
+    if use_allure:
+        _emit_allure_attach(lines, "result", "Output")
+    lines.append("")
+    return 1, ex, expr, typ, weak
+
+
+def _emit_exception_coverage_test(
+    lines: List[str],
+    *,
+    target: Dict[str, Any],
+    args: List[Dict[str, Any]],
+    cases: List[List[Any]],
+    exc_name: str,
+    call_expr: str,
+    obj_var: Optional[str],
+    is_async: bool,
+    def_prefix: str,
+    use_allure: bool,
+) -> int:
+    """Emit pytest.raises test cases and return generated case count."""
+    if not cases:
+        return 0
+
+    arg_names = [arg["name"] for arg in args]
+    display_name = _target_display_name(target)
+    if args:
+        case_ids = [_case_id(args, case) for case in cases]
+        lines.extend(_generate_parametrize_decorator(arg_names, cases, case_ids))
+        signature = ", ".join(arg_names)
+    else:
+        signature = ""
+
+    _extend_decorators(lines, is_async=is_async, use_allure=use_allure, title=f"Exception test for {display_name}")
+    lines.append(f"{def_prefix} {_target_test_name(target, 'exception')}({signature}):")
+    lines.append('    """Exception test generated from white-box exception-path objectives."""')
+    _emit_instance_setup(lines, target, obj_var)
+    if args:
+        _emit_input_data(lines, args)
+        if use_allure:
+            _emit_allure_attach(lines, "input_data", "Input")
+    if use_allure:
+        lines.append(f"    with allure.step('Expect exception from {display_name}'):")
+        lines.append(f"        with pytest.raises({exc_name}):")
+        lines.append(f"            {'await ' if is_async else ''}{call_expr}")
+    else:
+        lines.append(f"    with pytest.raises({exc_name}):")
+        lines.append(f"        {'await ' if is_async else ''}{call_expr}")
+    lines.append("")
+    return len(cases)
 
 # ============================================================================
 # MAIN GENERATION
@@ -693,7 +696,7 @@ def generate_test_file(
                 "exact_assertions": 0,
                 "expression_assertions": 0,
                 "type_assertions": 0,
-                "smoke_assertions": 0,
+                "weak_assertions": 0,
             }
 
         if not supported_targets:
@@ -708,7 +711,7 @@ def generate_test_file(
                 "exact_assertions": 0,
                 "expression_assertions": 0,
                 "type_assertions": 0,
-                "smoke_assertions": 0,
+                "weak_assertions": 0,
             }
 
         module_name = os.path.basename(source_file).replace(".py", "")
@@ -735,7 +738,7 @@ def generate_test_file(
         exact_assertions = 0
         expression_assertions = 0
         type_assertions = 0
-        smoke_assertions = 0
+        weak_assertions = 0
 
         for target in supported_targets:
             func = target["func"]
@@ -758,215 +761,124 @@ def generate_test_file(
                 generated_tests += 1
                 continue
 
-            if not args:
-                call_expr = _target_call_name(target, [], obj_var)
-                if func.get("unconditional_raise"):
-                    exc_name = _infer_exception_name(func)
-                    if exc_name:
-                        _extend_decorators(lines, is_async=is_async, use_allure=use_allure, title=f"Exception test for {display_name}")
-                        lines.append(f"{def_prefix} {_target_test_name(target, 'raises')}():")
-                        lines.append('    """Exception-path test generated from raise-condition analysis."""')
-                        _emit_instance_setup(lines, target, obj_var)
-                        if use_allure:
-                            lines.append(f"    with allure.step('Expect exception from {display_name}'):")
-                            lines.append(f"        with pytest.raises({exc_name}):")
-                            lines.append(f"            {'await ' if is_async else ''}{call_expr}")
-                        else:
-                            lines.append(f"    with pytest.raises({exc_name}):")
-                            lines.append(f"        {'await ' if is_async else ''}{call_expr}")
-                        lines.append("")
-                        generated_tests += 1
-                        exact_assertions += 1
-                    else:
-                        lines.extend([
-                            "@pytest.mark.skip(reason='unconditional raise detected but exact exception type unresolved')",
-                            f"def {_target_test_name(target, 'raises_unresolved')}():",
-                            "    pass",
-                            "",
-                        ])
-                        generated_tests += 1
-                    continue
+            arg_names = [arg["name"] for arg in args]
+            call_expr = _target_call_name(target, arg_names, obj_var)
+            whitebox_plan = plan_whitebox_cases(
+                func,
+                args,
+                func.get("try_except_blocks", []),
+            )
+            unresolved_objectives = whitebox_plan.get("unresolved_objectives", [])
+            # Store unresolved objectives on the function metadata so the result
+            # can report limits without generating unreliable placeholder tests.
+            if unresolved_objectives:
+                func["unresolved_objectives"] = unresolved_objectives
 
-                from .assertion_inference import infer_assertion_plan
-                smoke_plan = infer_assertion_plan(func, [])
-
-                _extend_decorators(lines, is_async=is_async, use_allure=use_allure, title=f"Smoke test for {display_name}")
-                lines.append(f"{def_prefix} {_target_test_name(target, 'smoke')}():")
-                lines.append('    """Smoke test generated from static AST analysis."""')
-                _emit_instance_setup(lines, target, obj_var)
-                _emit_execute_call(
-                    lines,
-                    call_expr=call_expr,
-                    is_async=is_async,
-                    use_allure=use_allure,
-                    display_name=display_name,
-                )
-                _emit_assertion_for_plan(lines, smoke_plan, use_allure=use_allure)
-                if use_allure:
-                    _emit_allure_attach(lines, "result", "Output")
-                lines.append("")
-                generated_tests += 1
-
-                if smoke_plan["strength_level"] in {2, 4}:
-                    exact_assertions += 1
-                elif smoke_plan["strength_level"] == 3:
-                    expression_assertions += 1
-                elif smoke_plan["strength_level"] == 1:
-                    type_assertions += 1
+            # Unconditional raise without parameters is a special case. The
+            # current planner focuses on branch/decision objectives and keeps
+            # no-argument unconditional raises safe here in the generator.
+            if not args and func.get("unconditional_raise"):
+                exc_name = _infer_exception_name(func)
+                if exc_name:
+                    emitted = _emit_exception_coverage_test(
+                        lines,
+                        target=target,
+                        args=args,
+                        cases=[[]],
+                        exc_name=exc_name,
+                        call_expr=call_expr,
+                        obj_var=obj_var,
+                        is_async=is_async,
+                        def_prefix=def_prefix,
+                        use_allure=use_allure,
+                    )
+                    generated_tests += emitted
+                    exact_assertions += emitted
                 else:
-                    smoke_assertions += 1
+                    func.setdefault("unresolved_objectives", []).append({
+                        "kind": "exception",
+                        "description": "Unconditional raise detected but exact exception type could not be inferred safely.",
+                    })
                 continue
 
-            safe_bundle = _build_safe_cases(args, func.get("branches", []), func.get("try_except_blocks", []))
-            smoke_values = safe_bundle["smoke"]
-            boundary_cases = safe_bundle["boundary"]
-            arg_names = [arg["name"] for arg in args]
-            param_names = ", ".join(arg_names)
-            call_expr = _target_call_name(target, arg_names, obj_var)
+            # Statement coverage: used for callables without branch objectives.
+            statement_cases = whitebox_plan.get("statement_cases", []) or []
+            if statement_cases:
+                counts = _emit_normal_coverage_test(
+                    lines,
+                    target=target,
+                    func=func,
+                    args=args,
+                    cases=statement_cases,
+                    suffix="statement_coverage",
+                    title=f"Statement coverage test for {display_name}",
+                    docstring="Statement coverage test generated from white-box objectives.",
+                    call_expr=call_expr,
+                    obj_var=obj_var,
+                    is_async=is_async,
+                    def_prefix=def_prefix,
+                    use_allure=use_allure,
+                    fallback_assertion=assert_line,
+                )
+                gen, ex, expr, typ, weak = counts
+                generated_tests += gen
+                exact_assertions += ex
+                expression_assertions += expr
+                type_assertions += typ
+                weak_assertions += weak
 
-            # Smoke test.
-            from .assertion_inference import infer_assertion_plan
-            smoke_plan = infer_assertion_plan(func, smoke_values)
+            # Branch coverage: primary white-box output for callables with
+            # decision branches. The planner has already selected reduced cases;
+            # do not append extra heuristic candidate cases here.
+            branch_cases = whitebox_plan.get("branch_cases", []) or []
+            if branch_cases:
+                counts = _emit_normal_coverage_test(
+                    lines,
+                    target=target,
+                    func=func,
+                    args=args,
+                    cases=branch_cases,
+                    suffix="branch_coverage",
+                    title=f"Branch coverage test for {display_name}",
+                    docstring="Branch coverage test generated from white-box branch objectives.",
+                    call_expr=call_expr,
+                    obj_var=obj_var,
+                    is_async=is_async,
+                    def_prefix=def_prefix,
+                    use_allure=use_allure,
+                    fallback_assertion=assert_line,
+                )
+                gen, ex, expr, typ, weak = counts
+                generated_tests += gen
+                exact_assertions += ex
+                expression_assertions += expr
+                type_assertions += typ
+                weak_assertions += weak
 
-            _extend_decorators(lines, is_async=is_async, use_allure=use_allure, title=f"Smoke test for {display_name}")
-            lines.append(f"{def_prefix} {_target_test_name(target, 'smoke')}():")
-            lines.append('    """Smoke test generated from static AST analysis."""')
-            _emit_instance_setup(lines, target, obj_var)
-            _emit_value_assignments(lines, args, smoke_values)
-            _emit_input_data(lines, args)
-            if use_allure:
-                _emit_allure_attach(lines, "input_data", "Input")
-            _emit_execute_call(
-                lines,
-                call_expr=call_expr,
-                is_async=is_async,
-                use_allure=use_allure,
-                display_name=display_name,
-            )
-            _emit_assertion_for_plan(lines, smoke_plan, use_allure=use_allure)
-            if use_allure:
-                _emit_allure_attach(lines, "result", "Output")
-            lines.append("")
-            generated_tests += 1
-
-            if smoke_plan["strength_level"] in {2, 4}:
-                exact_assertions += 1
-            elif smoke_plan["strength_level"] == 3:
-                expression_assertions += 1
-            elif smoke_plan["strength_level"] == 1:
-                type_assertions += 1
-            else:
-                smoke_assertions += 1
-
-            # Boundary tests.
-            if len(boundary_cases) > 1:
-                plans = [infer_assertion_plan(func, case) for case in boundary_cases]
-                can_parametrize_expected = all(p["kind"] == "exact" and p["strength_level"] in {2, 4} for p in plans)
-
-                if can_parametrize_expected:
-                    extended_arg_names = arg_names + ["expected"]
-                    extended_param_names = ", ".join(extended_arg_names)
-                    extended_cases = []
-                    for case, plan in zip(boundary_cases, plans):
-                        try:
-                            raw_expected = ast.literal_eval(plan["expected"])
-                        except Exception:
-                            raw_expected = plan["expected"]
-                        extended_cases.append(case + [raw_expected])
-
-                    case_ids = [_case_id(args, case) for case in boundary_cases]
-                    lines.extend(_generate_parametrize_decorator(extended_arg_names, extended_cases, case_ids))
-                    _extend_decorators(lines, is_async=is_async, use_allure=use_allure, title=f"Boundary test for {display_name}")
-                    lines.append(f"{def_prefix} {_target_test_name(target, 'boundary')}({extended_param_names}):")
-                    lines.append('    """Boundary test generated from AST constraints."""')
-                    _emit_instance_setup(lines, target, obj_var)
-                    _emit_input_data(lines, args)
-                    if use_allure:
-                        _emit_allure_attach(lines, "input_data", "Input")
-                    _emit_execute_call(
-                        lines,
-                        call_expr=call_expr,
-                        is_async=is_async,
-                        use_allure=use_allure,
-                        display_name=display_name,
-                    )
-                    max_strength = max(p["strength_level"] for p in plans)
-                    desc = "Branch/path assertion" if max_strength == 4 else "Literal assertion"
-                    lines.append(f"    # Assertion strength: {max_strength} ({desc})")
-                    lines.append("    assert result == expected")
-                    if use_allure:
-                        _emit_allure_attach(lines, "result", "Output")
-                    lines.append("")
-                    exact_assertions += len(boundary_cases)
-                else:
-                    case_ids = [_case_id(args, case) for case in boundary_cases]
-                    lines.extend(_generate_parametrize_decorator(arg_names, boundary_cases, case_ids))
-                    _extend_decorators(lines, is_async=is_async, use_allure=use_allure, title=f"Boundary test for {display_name}")
-                    lines.append(f"{def_prefix} {_target_test_name(target, 'boundary')}({param_names}):")
-                    lines.append('    """Boundary test generated from AST constraints."""')
-                    _emit_instance_setup(lines, target, obj_var)
-                    _emit_input_data(lines, args)
-                    if use_allure:
-                        _emit_allure_attach(lines, "input_data", "Input")
-                    _emit_execute_call(
-                        lines,
-                        call_expr=call_expr,
-                        is_async=is_async,
-                        use_allure=use_allure,
-                        display_name=display_name,
-                    )
-                    # Check if all plans are a uniform Level 3 expression
-                    level_3_plans = [p for p in plans if p["strength_level"] == 3]
-                    if len(level_3_plans) == len(plans) and len({p["expected"] for p in plans}) == 1:
-                        plan = plans[0]
-                        lines.append(f"    {plan['comment']}")
-                        lines.append(f"    assert result == {plan['expected']}")
-                        expression_assertions += len(boundary_cases)
-                    else:
-                        _emit_result_assertion(lines, assert_line, use_allure=use_allure)
-                        if not assert_line:
-                            smoke_assertions += len(boundary_cases)
-                        elif "isinstance(" in assert_line or "is None" in assert_line:
-                            type_assertions += len(boundary_cases)
-                        elif "==" in assert_line:
-                            exact_assertions += len(boundary_cases)
-                        else:
-                            smoke_assertions += len(boundary_cases)
-                    if use_allure:
-                        _emit_allure_attach(lines, "result", "Output")
-                    lines.append("")
-                generated_tests += len(boundary_cases)
-
-            # Exception tests.
-            raise_cases = _build_raise_cases(args, func, smoke_values, func.get("try_except_blocks", []))
+            # Exception coverage: exception objectives are emitted separately so
+            # pytest.raises(...) stays explicit and readable.
+            exception_cases = whitebox_plan.get("exception_cases", []) or []
             exc_name = _infer_exception_name(func)
-            if raise_cases and exc_name:
-                raise_ids = [_case_id(args, case) for case in raise_cases]
-                lines.extend(_generate_parametrize_decorator(arg_names, raise_cases, raise_ids))
-                _extend_decorators(lines, is_async=is_async, use_allure=use_allure, title=f"Exception test for {display_name}")
-                lines.append(f"{def_prefix} {_target_test_name(target, 'raises')}({param_names}):")
-                lines.append('    """Exception-path test generated from raise-condition analysis."""')
-                _emit_instance_setup(lines, target, obj_var)
-                _emit_input_data(lines, args)
-                if use_allure:
-                    _emit_allure_attach(lines, "input_data", "Input")
-                    lines.append(f"    with allure.step('Expect exception from {display_name}'):")
-                    lines.append(f"        with pytest.raises({exc_name}):")
-                    lines.append(f"            {'await ' if is_async else ''}{call_expr}")
-                else:
-                    lines.append(f"    with pytest.raises({exc_name}):")
-                    lines.append(f"        {'await ' if is_async else ''}{call_expr}")
-                lines.append("")
-                generated_tests += len(raise_cases)
-                exact_assertions += len(raise_cases)
-            elif func.get("raises"):
-                lines.extend([
-                    "@pytest.mark.skip(reason='raise path detected but trigger tuple or exact exception type could not be inferred safely')",
-                    f"def {_target_test_name(target, 'raises_unresolved')}():",
-                    "    pass",
-                    "",
-                ])
-                generated_tests += 1
+            if exception_cases and exc_name:
+                emitted = _emit_exception_coverage_test(
+                    lines,
+                    target=target,
+                    args=args,
+                    cases=exception_cases,
+                    exc_name=exc_name,
+                    call_expr=call_expr,
+                    obj_var=obj_var,
+                    is_async=is_async,
+                    def_prefix=def_prefix,
+                    use_allure=use_allure,
+                )
+                generated_tests += emitted
+                exact_assertions += emitted
+            elif (func.get("raises") or any(obj.get("kind") == "exception" for obj in unresolved_objectives)) and not exception_cases:
+                func.setdefault("unresolved_objectives", []).append({
+                    "kind": "exception",
+                    "description": "Exception path detected but trigger tuple or exact exception type could not be inferred safely.",
+                })
 
         os.makedirs(output_dir, exist_ok=True)
         output_file = os.path.join(output_dir, f"test_{module_name}.py")
@@ -984,7 +896,7 @@ def generate_test_file(
             "exact_assertions": exact_assertions,
             "expression_assertions": expression_assertions,
             "type_assertions": type_assertions,
-            "smoke_assertions": smoke_assertions,
+            "weak_assertions": weak_assertions,
         }
     except Exception as e:
         return {
@@ -999,5 +911,5 @@ def generate_test_file(
             "exact_assertions": 0,
             "expression_assertions": 0,
             "type_assertions": 0,
-            "smoke_assertions": 0,
+            "weak_assertions": 0,
         }

@@ -30,7 +30,11 @@ except ImportError:  # pragma: no cover - optional presentation dependency
     HAS_RICH = False
 
 from .code_generator import generate_test_file
-from .coverage_config import ensure_coverage_config, get_coverage_cli_args
+from .coverage_config import (
+    ensure_coverage_config,
+    get_coverage_cli_args,
+    read_coverage_summary_from_xml,
+)
 
 console = Console() if HAS_RICH else None
 
@@ -224,6 +228,74 @@ def _count_callables(result: Dict[str, Any]) -> int:
     return len(functions) + _count_methods(classes)
 
 
+def _iter_callables(result: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    for func in result.get("functions", []) or []:
+        yield func
+    for cls in result.get("classes", []) or []:
+        constructor = cls.get("constructor")
+        if constructor:
+            yield constructor
+        for method in cls.get("methods", []) or []:
+            yield method
+
+
+def _count_unresolved_objectives(result: Dict[str, Any]) -> int:
+    total = 0
+    for func in _iter_callables(result):
+        total += len(func.get("unresolved_objectives", []) or [])
+    return total
+
+
+def _pytest_status_label(exit_code: Optional[int]) -> str:
+    if exit_code is None:
+        return "Not run"
+    if exit_code == 0:
+        return "Passed"
+    if exit_code == 1:
+        return "Failed"
+    if exit_code == 2:
+        return "Interrupted"
+    if exit_code == 3:
+        return "Internal error"
+    if exit_code == 4:
+        return "Usage error"
+    if exit_code == 5:
+        return "No tests collected"
+    return f"Exit code {exit_code}"
+
+
+def _format_percent(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        return f"{float(value):.2f}%"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def _coverage_lines(summary: Dict[str, Any]) -> List[tuple[str, Any]]:
+    cov = summary.get("coverage_summary") or {}
+    if not cov:
+        return []
+
+    lines_covered = cov.get("lines_covered")
+    lines_valid = cov.get("lines_valid")
+    branches_covered = cov.get("branches_covered")
+    branches_valid = cov.get("branches_valid")
+
+    rows: List[tuple[str, Any]] = []
+    if lines_covered is not None and lines_valid is not None:
+        rows.append(("Statements", f"{lines_covered}/{lines_valid}"))
+        rows.append(("Missing statements", max(0, int(lines_valid) - int(lines_covered))))
+    if branches_covered is not None and branches_valid is not None:
+        rows.append(("Branches", f"{branches_covered}/{branches_valid}"))
+    if cov.get("line_percent") is not None:
+        rows.append(("Statement coverage", _format_percent(cov.get("line_percent"))))
+    if cov.get("branch_percent") is not None:
+        rows.append(("Branch coverage", _format_percent(cov.get("branch_percent"))))
+    return rows
+
+
 def _callable_signature(func: Dict[str, Any]) -> str:
     args = ", ".join(
         f"{arg['name']}: {arg.get('annotation', 'Any')}"
@@ -234,35 +306,65 @@ def _callable_signature(func: Dict[str, Any]) -> str:
 
 
 def _print_rich_summary(summary: Dict[str, Any], dry_run: bool) -> None:
+    """Print the public, white-box-oriented generation summary.
+
+    Deliberately hides internal candidate/discarded counts. The CLI summary is
+    meant to communicate the final test suite and coverage verification, not
+    implementation telemetry from the selector.
+    """
+    main_rows: List[tuple[str, Any]] = [
+        ("White-box criterion", "Branch/Decision Coverage"),
+        ("Input files scanned", summary["scanned_files"]),
+        ("Supported callables", summary["supported_callables"]),
+        ("Skipped callables", summary["skipped_callables"]),
+    ]
+
+    if not dry_run:
+        main_rows.extend([
+            ("Generated test files", summary["generated_test_files"]),
+            ("Generated test cases", summary["generated_test_cases"]),
+            ("Unresolved objectives", summary.get("unresolved_objectives", 0)),
+        ])
+
+    if summary.get("syntax_error_files"):
+        main_rows.append(("Syntax-error files", summary["syntax_error_files"]))
+    if summary.get("generation_error_files"):
+        main_rows.append(("Generation-error files", summary["generation_error_files"]))
+
+    pytest_exit = summary.get("pytest_exit_code")
+    if pytest_exit is not None:
+        main_rows.append(("Pytest result", _pytest_status_label(pytest_exit)))
+        main_rows.append(("Pytest exit code", pytest_exit))
+
+    coverage_rows = _coverage_lines(summary)
+
     if not HAS_RICH:
-        print("\n--- Auto Test Generator Summary ---")
-        for key, value in summary.items():
-            print(f"{key.replace('_', ' ').capitalize():<28}: {value}")
-        print("-----------------------------------")
+        print("\n============================================================")
+        print("AUTO TEST GENERATION SUMMARY")
+        print("============================================================")
+        for key, value in main_rows:
+            print(f"{key:<24}: {value}")
+        if coverage_rows:
+            print("\nCOVERAGE RESULT")
+            print("------------------------------------------------------------")
+            for key, value in coverage_rows:
+                print(f"{key:<24}: {value}")
+        print("============================================================")
         return
 
-    table = Table(title="[bold blue]Auto Test Generator Summary[/bold blue]")
+    table = Table(title="[bold blue]Auto Test Generation Summary[/bold blue]")
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="magenta", justify="right")
 
-    rows = [
-        ("Scanned files", summary["scanned_files"]),
-        ("Supported callables", summary["supported_callables"]),
-        ("Skipped callables", summary["skipped_callables"]),
-        ("Generated test cases", summary["generated_test_cases"]),
-        ("Syntax-error files", summary["syntax_error_files"]),
-        ("Generation-error files", summary["generation_error_files"]),
-    ]
-    if not dry_run:
-        rows.insert(3, ("Generated test files", summary["generated_test_files"]))
-    if summary.get("pytest_exit_code") is not None:
-        rows.append(("Pytest exit code", summary["pytest_exit_code"]))
-
-    for label, value in rows:
+    for label, value in main_rows:
         table.add_row(label, str(value))
 
-    console.print(table)
+    if coverage_rows:
+        table.add_section()
+        for label, value in coverage_rows:
+            table.add_row(label, str(value))
 
+    console.print(table)
 
 def _print_file_detail(message: str) -> None:
     if HAS_RICH:
@@ -343,6 +445,7 @@ def _update_summary(summary: Dict[str, Any], result: Dict[str, Any], verbose: bo
     summary["supported_callables"] += max(0, total_callables - len(skipped))
     summary["skipped_callables"] += len(skipped)
     summary["generated_test_cases"] += result.get("generated_tests", 0)
+    summary["unresolved_objectives"] += _count_unresolved_objectives(result)
 
     if status == "syntax_error":
         summary["syntax_error_files"] += 1
@@ -597,7 +700,9 @@ def main() -> None:
         "supported_callables": 0,
         "skipped_callables": 0,
         "generated_test_cases": 0,
+        "unresolved_objectives": 0,
         "pytest_exit_code": None,
+        "coverage_summary": {},
     }
 
     if not args.dry_run:
@@ -640,6 +745,8 @@ def main() -> None:
             use_allure=args.allure,
         )
         summary["pytest_exit_code"] = pytest_exit_code
+        if args.cov:
+            summary["coverage_summary"] = read_coverage_summary_from_xml("coverage.xml")
 
     _print_rich_summary(summary, args.dry_run)
 
