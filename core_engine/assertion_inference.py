@@ -86,6 +86,10 @@ def evaluate_constraint(constraint: Dict[str, Any], input_values: Dict[str, Any]
 
     op = constraint.get("op")
     target_val = constraint.get("value")
+    if constraint.get("value_is_symbol") and isinstance(target_val, str):
+        if target_val not in input_values:
+            return False
+        target_val = input_values[target_val]
 
     try:
         if op == "Eq":
@@ -211,8 +215,21 @@ def _render_return_plan(
     *,
     level: int,
     comment: str,
+    input_values: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     expr = ret.get("expression") or {}
+    input_values = input_values or {}
+    if expr.get("kind") == "name":
+        name = expr.get("name") or ret.get("source")
+        if isinstance(name, str) and name in input_values:
+            return {
+                "kind": "exact",
+                "expected": repr(input_values[name]),
+                "strength_level": level,
+                "strength_name": "branch_path" if level == 4 else "literal",
+                "comment": comment,
+            }
+
     if expr.get("kind") == "literal":
         return {
             "kind": "exact",
@@ -324,6 +341,122 @@ def _fallback_to_safe_assertion(func_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+
+def _branch_has_interrupt(branch: Dict[str, Any], kind: Optional[str] = None) -> bool:
+    """Detect common branch-body control-flow interrupts from parser metadata."""
+    segment = branch.get("source_segment") or ""
+    has_continue = "continue" in segment
+    has_break = "break" in segment
+    has_return = bool(branch.get("body_returns")) or "return" in segment
+    has_raise = bool(branch.get("has_body_raise")) or "raise " in segment
+    if kind == "continue":
+        return has_continue
+    if kind == "break":
+        return has_break
+    if kind == "return":
+        return has_return
+    if kind == "raise":
+        return has_raise
+    return has_continue or has_break or has_return or has_raise
+
+
+def _branches_inside_loop(func_data: Dict[str, Any], loop: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return branches placed syntactically inside a simple loop body."""
+    start = int(loop.get("lineno", 0) or 0)
+    end = int(loop.get("end_lineno", start) or start)
+    branches = [
+        branch for branch in (func_data.get("branches") or [])
+        if start < int(branch.get("lineno", 0) or 0) <= end
+    ]
+    return sorted(branches, key=lambda b: int(b.get("lineno", 0) or 0))
+
+
+def _infer_loop_return_plan(
+    func_data: Dict[str, Any],
+    input_values: Dict[str, Any],
+    args_set: Set[str],
+) -> Optional[Dict[str, Any]]:
+    """Infer exact returns from simple `for item in items` loops.
+
+    This covers realistic search loops such as:
+        for number in numbers:
+            if number > threshold:
+                return number
+        return None
+
+    The loop target is a local variable, so ordinary argument-only return
+    inference cannot resolve `return number`. Here we simulate only the selected
+    input collection and common control-flow interrupts.
+    """
+    lookup = _branch_lookup(func_data.get("branches") or [])
+
+    for loop in func_data.get("loops") or []:
+        if loop.get("type") not in {"for", "async_for"}:
+            continue
+        iter_name = loop.get("iter")
+        target = loop.get("target")
+        if not isinstance(iter_name, str) or not isinstance(target, str):
+            continue
+        iterable = input_values.get(iter_name)
+        if not isinstance(iterable, (list, tuple, set)):
+            continue
+
+        loop_branches = _branches_inside_loop(func_data, loop)
+        stop_loop = False
+        for item in iterable:
+            if stop_loop:
+                break
+            local_values = dict(input_values)
+            local_values[target] = item
+            local_args = set(args_set)
+            local_args.add(target)
+
+            for branch in loop_branches:
+                if not _branch_gates_satisfied(branch, local_values, lookup):
+                    continue
+                matched = evaluate_condition(branch.get("condition") or {}, local_values)
+
+                if matched:
+                    if branch.get("raise_when") == "truthy":
+                        return None
+                    body_returns = branch.get("body_returns") or []
+                    if body_returns:
+                        plan = _render_return_plan(
+                            body_returns[0],
+                            local_args,
+                            level=4,
+                            comment="# Assertion strength: 4 (Branch/path assertion)",
+                            input_values=local_values,
+                        )
+                        if plan:
+                            return plan
+
+                    if _branch_has_interrupt(branch, "continue"):
+                        break
+                    if _branch_has_interrupt(branch, "break"):
+                        stop_loop = True
+                        break
+                    if _branch_has_interrupt(branch, "raise"):
+                        return None
+
+                else:
+                    if branch.get("raise_when") == "falsy":
+                        return None
+                    if branch.get("has_direct_else"):
+                        else_returns = branch.get("else_returns") or []
+                        if else_returns:
+                            plan = _render_return_plan(
+                                else_returns[0],
+                                local_args,
+                                level=4,
+                                comment="# Assertion strength: 4 (Branch/path assertion via else)",
+                                input_values=local_values,
+                            )
+                            if plan:
+                                return plan
+    return None
+
+
 def infer_assertion_plan(
     func_data: Dict[str, Any],
     input_case: Union[List[Any], Tuple[Any, ...]]
@@ -339,6 +472,10 @@ def infer_assertion_plan(
     input_values = {}
     for arg_spec, val in zip(args, input_case):
         input_values[arg_spec["name"]] = val
+
+    loop_plan = _infer_loop_return_plan(func_data, input_values, args_set)
+    if loop_plan:
+        return loop_plan
 
     # 1. Trace branches (Control Flow Path Analysis - Level 4).
     # Prefer deeper branches first so nested returns beat their parent fallback

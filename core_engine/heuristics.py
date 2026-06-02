@@ -53,7 +53,7 @@ _SEMANTIC_KEYWORDS: list[tuple[SemanticCategory, tuple[str, ...]]] = [
     (SemanticCategory.PERCENTAGE, ("percentage", "percent", "ratio", "rate")),
     (SemanticCategory.PRICE, ("price", "amount", "total", "subtotal", "fee", "cost")),
     (SemanticCategory.AGE, ("age",)),
-    (SemanticCategory.COUNT, ("count", "qty", "quantity", "size", "length", "limit", "offset", "page")),
+    (SemanticCategory.COUNT, ("count", "qty", "quantity", "size", "length", "limit", "threshold", "offset", "page")),
     (SemanticCategory.ID, ("id", "uuid", "code", "status_code")),
     (SemanticCategory.BOOLEAN, ("is_", "has_", "can_", "should_", "active", "enabled", "flag", "valid", "visible")),
     (SemanticCategory.USERNAME, ("username", "user_name", "login")),
@@ -440,6 +440,17 @@ def _infer_type_from_constraint(constraint: Dict[str, Any], param_name: str) -> 
     value = constraint.get("value")
     op = constraint.get("op")
 
+    # A comparison such as `number > threshold` stores the right-hand side as
+    # a symbol name, not as the string literal "threshold". Treat order
+    # comparisons between symbols as numeric by default; otherwise a loop
+    # element may be inferred as `str` and generate invalid inputs like
+    # numbers=[''] for `number > threshold`.
+    if constraint.get("value_is_symbol") and op in {"Lt", "LtE", "Gt", "GtE"}:
+        semantic = _infer_type_from_semantics(param_name)
+        if semantic in {"int", "float"}:
+            return semantic
+        return "int"
+
     if transform in {"strip", "lower", "upper", "startswith", "endswith", "isdigit", "isalpha"}:
         return "str"
 
@@ -546,6 +557,16 @@ def boundary_values(op: str, pivot: Any, inferred_type: str, transform: Optional
     transform_values = _string_transform_values(transform, op, pivot)
     if transform_values:
         return transform_values
+
+    # Symbolic comparisons such as `number > threshold` do not have a literal
+    # pivot. Generate numeric candidates around the common smoke threshold 0 so
+    # loop cases can cover both sides without falling back to string values.
+    if isinstance(pivot, str) and op in {"Lt", "LtE", "Gt", "GtE"}:
+        normalized = _normalize_annotation(inferred_type)
+        if normalized == "int":
+            return [-1, 0, 1, 100]
+        if normalized == "float":
+            return [-1.0, 0.0, 1.0, 100.0]
 
     numeric = _numeric_boundary(op, pivot, inferred_type)
     if numeric:
@@ -782,13 +803,19 @@ def build_arg_strategy(
     if len(priority_boundary) >= 2:
         smoke_value = priority_boundary[1]
     else:
-        smoke_value = next(
-            (
-                value for value in combined_safe
-                if value not in [None, "", [], {}]
-            ),
-            combined_safe[0] if combined_safe else None,
-        )
+        normalized_type = _normalize_annotation(inferred_type)
+        if normalized_type in {"int", "float"} and 0 in combined_safe:
+            smoke_value = 0
+        elif normalized_type == "float" and 0.0 in combined_safe:
+            smoke_value = 0.0
+        else:
+            smoke_value = next(
+                (
+                    value for value in combined_safe
+                    if value not in [None, "", [], {}]
+                ),
+                combined_safe[0] if combined_safe else None,
+            )
 
     return {
         "safe": combined_safe,
