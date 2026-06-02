@@ -118,6 +118,117 @@ def evaluate_constraint(constraint: Dict[str, Any], input_values: Dict[str, Any]
     return False
 
 
+def _branch_lookup(branches: List[Dict[str, Any]]) -> Dict[Any, Dict[str, Any]]:
+    return {
+        branch.get("branch_index"): branch
+        for branch in branches
+        if branch.get("branch_index") is not None
+    }
+
+
+def _gate_signature(branch: Dict[str, Any]) -> Tuple[Tuple[Any, Any], ...]:
+    return tuple(
+        (gate.get("branch_index"), gate.get("side"))
+        for gate in (branch.get("gates") or [])
+    )
+
+
+def _same_scope(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    return (
+        int(left.get("depth", 0) or 0) == int(right.get("depth", 0) or 0)
+        and _gate_signature(left) == _gate_signature(right)
+    )
+
+
+def _blocked_by_previous_same_scope_guard(
+    branch: Dict[str, Any],
+    branches: List[Dict[str, Any]],
+    input_values: Dict[str, Any],
+    lookup: Dict[Any, Dict[str, Any]],
+) -> bool:
+    """Return True when an earlier same-scope guard return/raise has taken over."""
+    branch_index = branch.get("branch_index")
+    for previous in branches:
+        if previous.get("branch_index") == branch_index:
+            return False
+        if not _same_scope(previous, branch):
+            continue
+        is_guard = bool(
+            previous.get("body_returns")
+            or previous.get("has_body_raise")
+            or previous.get("has_direct_else")
+        )
+        if not is_guard:
+            continue
+        if not _branch_gates_satisfied(previous, input_values, lookup):
+            continue
+        if evaluate_condition(previous.get("condition") or {}, input_values):
+            return True
+    return False
+
+
+def _branch_gates_satisfied(
+    branch: Dict[str, Any],
+    input_values: Dict[str, Any],
+    lookup: Dict[Any, Dict[str, Any]],
+    seen: Optional[Set[Any]] = None,
+) -> bool:
+    gates = branch.get("gates") or []
+    if not gates:
+        return True
+
+    seen = set(seen or set())
+    current_index = branch.get("branch_index")
+    if current_index is not None:
+        seen.add(current_index)
+
+    for gate in gates:
+        gate_index = gate.get("branch_index")
+        if gate_index in seen:
+            return False
+        gate_branch = lookup.get(gate_index)
+        if not gate_branch:
+            return False
+        if not _branch_gates_satisfied(gate_branch, input_values, lookup, seen):
+            return False
+        matched = evaluate_condition(gate_branch.get("condition") or {}, input_values)
+        if gate.get("side") == "truthy" and not matched:
+            return False
+        if gate.get("side") == "falsy" and matched:
+            return False
+    return True
+
+
+def _render_return_plan(
+    ret: Dict[str, Any],
+    args_set: Set[str],
+    *,
+    level: int,
+    comment: str,
+) -> Optional[Dict[str, Any]]:
+    expr = ret.get("expression") or {}
+    if expr.get("kind") == "literal":
+        return {
+            "kind": "exact",
+            "expected": repr(expr.get("literal")),
+            "strength_level": level,
+            "strength_name": "branch_path" if level == 4 else "literal",
+            "comment": comment,
+        }
+
+    ret_source = ret.get("source")
+    if ret_source and _is_safe_expression(ret_source, args_set):
+        return {
+            "kind": "exact",
+            "expected": ret_source,
+            "strength_level": 3,
+            "strength_name": "expression",
+            "comment": "# Assertion strength: 3 (Expression assertion inside branch)",
+        }
+
+    return None
+
+
 def evaluate_condition(cond: Dict[str, Any], input_values: Dict[str, Any]) -> bool:
     """Recursively evaluate an AST parsed condition against runtime input values."""
     cond_type = cond.get("type")
@@ -223,69 +334,53 @@ def infer_assertion_plan(
     for arg_spec, val in zip(args, input_case):
         input_values[arg_spec["name"]] = val
 
-    # 1. Trace branches (Control Flow Path Analysis - Level 4)
+    # 1. Trace branches (Control Flow Path Analysis - Level 4).
+    # Prefer deeper branches first so nested returns beat their parent fallback
+    # return when both are syntactically inside the same outer if-body.
     branches = func_data.get("branches") or []
-    for branch in branches:
-        cond = branch.get("condition") or {}
-        if evaluate_condition(cond, input_values):
-            # If the branch matches but contains nested control flow, fallback immediately
-            if branch.get("has_nested_control_flow"):
-                return _fallback_to_safe_assertion(func_data)
+    lookup = _branch_lookup(branches)
+    ordered_branches = sorted(
+        branches,
+        key=lambda b: (int(b.get("depth", 0) or 0), int(b.get("lineno", 0) or 0)),
+        reverse=True,
+    )
 
-            # Check if this branch returns a value
+    for branch in ordered_branches:
+        if not _branch_gates_satisfied(branch, input_values, lookup):
+            continue
+        if _blocked_by_previous_same_scope_guard(branch, branches, input_values, lookup):
+            continue
+
+        cond = branch.get("condition") or {}
+        matched = evaluate_condition(cond, input_values)
+
+        if matched:
+            if branch.get("raise_when") == "truthy":
+                continue
             body_returns = branch.get("body_returns") or []
             if body_returns:
-                ret = body_returns[0]
-                expr = ret.get("expression") or {}
-                # Handle literal return inside matched branch
-                if expr.get("kind") == "literal":
-                    lit_val = expr.get("literal")
-                    return {
-                        "kind": "exact",
-                        "expected": repr(lit_val),
-                        "strength_level": 4,
-                        "strength_name": "branch_path",
-                        "comment": "# Assertion strength: 4 (Branch/path assertion)",
-                    }
-                # Handle safe expression return inside matched branch
-                ret_source = ret.get("source")
-                if ret_source and _is_safe_expression(ret_source, args_set):
-                    return {
-                        "kind": "exact",
-                        "expected": ret_source,
-                        "strength_level": 3,
-                        "strength_name": "expression",
-                        "comment": "# Assertion strength: 3 (Expression assertion inside branch)",
-                    }
+                plan = _render_return_plan(
+                    body_returns[0],
+                    args_set,
+                    level=4,
+                    comment="# Assertion strength: 4 (Branch/path assertion)",
+                )
+                if plan:
+                    return plan
         else:
-            # Branch condition is False. If there's a direct orelse/else return block:
+            if branch.get("raise_when") == "falsy":
+                continue
             if branch.get("has_direct_else"):
-                # If the else branch matches but has nested control flow inside else, fallback
-                if branch.get("has_else_nested_control_flow"):
-                    return _fallback_to_safe_assertion(func_data)
-
                 else_returns = branch.get("else_returns") or []
                 if else_returns:
-                    ret = else_returns[0]
-                    expr = ret.get("expression") or {}
-                    if expr.get("kind") == "literal":
-                        lit_val = expr.get("literal")
-                        return {
-                            "kind": "exact",
-                            "expected": repr(lit_val),
-                            "strength_level": 4,
-                            "strength_name": "branch_path",
-                            "comment": "# Assertion strength: 4 (Branch/path assertion via else)",
-                        }
-                    ret_source = ret.get("source")
-                    if ret_source and _is_safe_expression(ret_source, args_set):
-                        return {
-                            "kind": "exact",
-                            "expected": ret_source,
-                            "strength_level": 3,
-                            "strength_name": "expression",
-                            "comment": "# Assertion strength: 3 (Expression assertion inside else)",
-                        }
+                    plan = _render_return_plan(
+                        else_returns[0],
+                        args_set,
+                        level=4,
+                        comment="# Assertion strength: 4 (Branch/path assertion via else)",
+                    )
+                    if plan:
+                        return plan
 
     # 2. Outer-scope / fallthrough return analysis
     returns = func_data.get("returns") or []

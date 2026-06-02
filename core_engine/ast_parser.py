@@ -691,6 +691,11 @@ class BodyVisitor(ast.NodeVisitor):
         self.loops: List[Dict[str, Any]] = []
         self.returns: List[Dict[str, Any]] = []
         self._conditional_depth = 0
+        # Branch context gates model reachability for nested decisions.
+        # A nested if inside an outer if-body is reachable only when the
+        # outer condition is truthy; a nested if inside an else-body is
+        # reachable only when the outer condition is falsy.
+        self._branch_context_stack: List[Dict[str, Any]] = []
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         return
@@ -720,13 +725,35 @@ class BodyVisitor(ast.NodeVisitor):
             self.exception_types.append(exc_name)
 
     def visit_If(self, node: ast.If) -> None:
-        self._capture_if_branch(node)
+        branch_info = self._capture_if_branch(node)
+        truthy_gate = {
+            "branch_index": branch_info.get("branch_index"),
+            "side": "truthy",
+            "source": branch_info.get("source"),
+            "lineno": branch_info.get("lineno"),
+        }
+        falsy_gate = {
+            "branch_index": branch_info.get("branch_index"),
+            "side": "falsy",
+            "source": branch_info.get("source"),
+            "lineno": branch_info.get("lineno"),
+        }
+
         self._conditional_depth += 1
         try:
-            for stmt in node.body:
-                self.visit(stmt)
-            for stmt in node.orelse:
-                self.visit(stmt)
+            self._branch_context_stack.append(truthy_gate)
+            try:
+                for stmt in node.body:
+                    self.visit(stmt)
+            finally:
+                self._branch_context_stack.pop()
+
+            self._branch_context_stack.append(falsy_gate)
+            try:
+                for stmt in node.orelse:
+                    self.visit(stmt)
+            finally:
+                self._branch_context_stack.pop()
         finally:
             self._conditional_depth -= 1
 
@@ -818,7 +845,7 @@ class BodyVisitor(ast.NodeVisitor):
         finally:
             self._conditional_depth -= 1
 
-    def _capture_if_branch(self, node: ast.If) -> None:
+    def _capture_if_branch(self, node: ast.If) -> Dict[str, Any]:
         condition_meta = _parse_condition(node.test, self.source_text)
         body_meta = _inspect_block_for_raise(node.body)
         else_meta = _inspect_block_for_raise(node.orelse)
@@ -851,7 +878,11 @@ class BodyVisitor(ast.NodeVisitor):
                 else None
             )
 
+        branch_index = len(self.branches)
         branch_info: Dict[str, Any] = {
+            "branch_index": branch_index,
+            "depth": self._conditional_depth,
+            "gates": [dict(gate) for gate in self._branch_context_stack],
             "source": condition_meta.get("source", ""),
             "raise_when": raise_when,
             "exception_type": exception_type,
@@ -891,6 +922,7 @@ class BodyVisitor(ast.NodeVisitor):
             branch_info["value"] = value
 
         self.branches.append(branch_info)
+        return branch_info
 
 
 # ============================================================================

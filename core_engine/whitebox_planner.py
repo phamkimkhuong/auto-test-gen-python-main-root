@@ -99,6 +99,70 @@ def _input_values(args: Sequence[Dict[str, Any]], case: Sequence[Any]) -> Dict[s
     }
 
 
+def _gate_signature(branch: Dict[str, Any]) -> Tuple[Tuple[Any, Any], ...]:
+    """Return a stable signature of reachability gates for branch grouping."""
+    return tuple(
+        (gate.get("branch_index"), gate.get("side"))
+        for gate in (branch.get("gates") or [])
+    )
+
+
+def _same_branch_scope(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    """Branches in different nesting contexts must not be grouped together."""
+    return (
+        left.get("depth", 0) == right.get("depth", 0)
+        and _gate_signature(left) == _gate_signature(right)
+    )
+
+
+def _branch_lookup(func: Dict[str, Any]) -> Dict[Any, Dict[str, Any]]:
+    return {
+        branch.get("branch_index"): branch
+        for branch in (func.get("branches") or [])
+        if branch.get("branch_index") is not None
+    }
+
+
+def _branch_gates_satisfied(
+    func: Dict[str, Any],
+    branch: Dict[str, Any],
+    values: Dict[str, Any],
+    *,
+    seen: Optional[Set[Any]] = None,
+) -> bool:
+    """Check whether the outer conditions required to reach a branch hold."""
+    gates = branch.get("gates") or []
+    if not gates:
+        return True
+
+    lookup = _branch_lookup(func)
+    seen = set(seen or set())
+    current_id = branch.get("branch_index")
+    if current_id is not None:
+        seen.add(current_id)
+
+    for gate in gates:
+        gate_index = gate.get("branch_index")
+        if gate_index in seen:
+            return False
+        gate_branch = lookup.get(gate_index)
+        if not gate_branch:
+            return False
+
+        can_true, can_false, executed = _branch_outcomes(
+            func,
+            gate_branch,
+            values,
+            seen=seen,
+        )
+        if not executed:
+            return False
+        if gate.get("side") == "truthy" and not can_true:
+            return False
+        if gate.get("side") == "falsy" and not can_false:
+            return False
+
+    return True
 
 
 def _safe_eval_condition_source(source: str, values: Dict[str, Any]) -> Optional[bool]:
@@ -172,7 +236,13 @@ def _loop_for_branch(func: Dict[str, Any], branch: Dict[str, Any]) -> Optional[D
     return None
 
 
-def _branch_outcomes(func: Dict[str, Any], branch: Dict[str, Any], values: Dict[str, Any]) -> Tuple[bool, bool, bool]:
+def _branch_outcomes(
+    func: Dict[str, Any],
+    branch: Dict[str, Any],
+    values: Dict[str, Any],
+    *,
+    seen: Optional[Set[Any]] = None,
+) -> Tuple[bool, bool, bool]:
     """
     Return (can_true, can_false, executed) for a branch under one input case.
 
@@ -180,6 +250,9 @@ def _branch_outcomes(func: Dict[str, Any], branch: Dict[str, Any], values: Dict[
     branch inside `for item in items`, the same input case may cover both true
     and false edges if the collection contains values of both kinds.
     """
+    if not _branch_gates_satisfied(func, branch, values, seen=seen):
+        return False, False, False
+
     loop = _loop_for_branch(func, branch)
     if not loop:
         matched = _condition_matches(branch, values)
@@ -212,57 +285,61 @@ def _branch_outcomes(func: Dict[str, Any], branch: Dict[str, Any], values: Dict[
 
 def _branch_groups(branches: Sequence[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
     """
-    Group simple if/elif chains and guard-clause chains.
+    Group decision branches by reachable sibling scope.
 
-    ast_parser.py emits each `if` or `elif` as a branch item in source order.
-    This helper models two common control-flow shapes without building a full
-    CFG:
+    A nested branch must not be merged into the same decision chain as its
+    parent. At the same time, a parent guard chain should continue after nested
+    body branches, for example:
 
-    1. if/elif chains: later conditions are reachable only when previous
-       conditions are false. Parser metadata marks intermediate items with
-       has_elif=True.
-    2. guard clauses with early return/raise:
+        if weight <= 1:
+            if express:
+                return 30
+            return 15
+        if weight <= 5:
+            return 40
 
-           if x == "":
-               return "empty"
-           if len(x) == 1:
-               return "single"
-           return "other"
-
-       The second if is reachable only if the first guard is false. Therefore
-       consecutive guard branches are grouped as one decision chain.
-
-    This is still not a full Control Flow Graph. It is a practical and
-    deterministic approximation for the metadata produced by the current parser.
+    The top-level chain is [weight <= 1, weight <= 5]; the nested chain is
+    [express]. This helper keeps one open group per scope signature so nested
+    branches do not prematurely close their parent chain.
     """
     groups: List[List[Dict[str, Any]]] = []
-    current: List[Dict[str, Any]] = []
+    open_groups: Dict[Tuple[int, Tuple[Tuple[Any, Any], ...]], List[Dict[str, Any]]] = {}
+    scope_order: List[Tuple[int, Tuple[Tuple[Any, Any], ...]]] = []
+
+    def scope_key(branch: Dict[str, Any]) -> Tuple[int, Tuple[Tuple[Any, Any], ...]]:
+        return int(branch.get("depth", 0) or 0), _gate_signature(branch)
+
+    def close_scope(key: Tuple[int, Tuple[Tuple[Any, Any], ...]]) -> None:
+        current = open_groups.pop(key, [])
+        if current:
+            groups.append(current)
 
     for branch in branches:
+        key = scope_key(branch)
+        if key not in open_groups:
+            open_groups[key] = []
+            scope_order.append(key)
+
+        current = open_groups[key]
         current.append(branch)
 
         if branch.get("has_elif"):
             continue
 
         if branch.get("has_direct_else"):
-            groups.append(current)
-            current = []
+            close_scope(key)
             continue
 
         is_guard = bool(branch.get("body_returns") or branch.get("has_body_raise"))
         if is_guard:
-            # Keep the group open so following guard clauses are treated as
-            # reachable only after this condition is false.
             continue
 
-        groups.append(current)
-        current = []
+        close_scope(key)
 
-    if current:
-        groups.append(current)
+    for key in scope_order:
+        close_scope(key)
 
     return groups
-
 
 def _branch_reachable_truthy(
     func: Dict[str, Any],
@@ -463,10 +540,104 @@ def _strategy_bundle(
     ]
 
 
+def _inner_annotation(annotation: str) -> str:
+    """Return T from common collection annotations such as list[T]."""
+    text = (annotation or "Any").replace("typing.", "").strip()
+    for prefix in ("list[", "List[", "Sequence[", "Iterable[", "tuple[", "Tuple[", "set[", "Set["):
+        if text.startswith(prefix) and text.endswith("]"):
+            return text[len(prefix):-1].strip() or "Any"
+    return "Any"
+
+
+def _loop_target_matches_branch(loop: Dict[str, Any], branch: Dict[str, Any]) -> bool:
+    target = loop.get("target")
+    if not isinstance(target, str) or not target:
+        return False
+    if branch.get("arg") == target or branch.get("base_arg") == target:
+        return True
+    for constraint in branch.get("constraints") or []:
+        if constraint.get("arg") == target or constraint.get("base_arg") == target:
+            return True
+    source = branch.get("source") or ""
+    return target in source.split() or target in source
+
+
+def _loop_collection_cases(
+    args: Sequence[Dict[str, Any]],
+    branches: Sequence[Dict[str, Any]],
+    loops: Sequence[Dict[str, Any]],
+    try_except_blocks: Optional[Sequence[Dict[str, Any]]],
+    smoke: Sequence[Any],
+) -> Dict[str, List[Case]]:
+    """Build extra candidates for simple `for item in items` branch coverage.
+
+    The ordinary argument strategy sees only the outer collection parameter.
+    For loop-local decisions such as `if score >= 50`, the useful boundary
+    values belong to the loop element (`score`), then must be wrapped into
+    the collection argument (`scores=[49, 50]`).
+    """
+    arg_index = {spec.get("name"): index for index, spec in enumerate(args)}
+    arg_by_name = {spec.get("name"): spec for spec in args}
+    normal_cases: List[Case] = []
+    exception_cases: List[Case] = []
+
+    for loop in loops:
+        if loop.get("type") not in {"for", "async_for"}:
+            continue
+        iter_name = loop.get("iter")
+        target = loop.get("target")
+        if not isinstance(iter_name, str) or iter_name not in arg_index:
+            continue
+        if not isinstance(target, str) or not target.isidentifier():
+            continue
+
+        loop_branches = [
+            branch for branch in branches
+            if _loop_target_matches_branch(loop, branch)
+        ]
+        if not loop_branches:
+            continue
+
+        iter_arg = arg_by_name.get(iter_name) or {}
+        fake_arg = {
+            "name": target,
+            "annotation": _inner_annotation(iter_arg.get("annotation", "Any")),
+            "kind": "positional_or_keyword",
+            "has_default": False,
+            "default": None,
+        }
+        element_strategy = build_arg_strategy(fake_arg, loop_branches, list(try_except_blocks or []))
+        safe_values = _dedupe_values(element_strategy.get("safe") or [])[:10]
+        raise_values = _dedupe_values(element_strategy.get("raise") or [])[:10]
+
+        collections: List[List[Any]] = [[]]
+        collections.extend([[value] for value in safe_values])
+        for left, right in itertools.combinations(safe_values[:6], 2):
+            collections.append([left, right])
+        if len(safe_values) >= 3:
+            collections.append([safe_values[0], safe_values[len(safe_values) // 2], safe_values[-1]])
+
+        for collection in _dedupe_values(collections):
+            case = list(smoke)
+            case[arg_index[iter_name]] = collection
+            normal_cases.append(case)
+
+        for value in raise_values:
+            case = list(smoke)
+            case[arg_index[iter_name]] = [value]
+            exception_cases.append(case)
+
+    return {
+        "normal": _dedupe_cases(normal_cases),
+        "exception": _dedupe_cases(exception_cases),
+    }
+
+
 def build_candidate_cases(
     args: Sequence[Dict[str, Any]],
     branches: Sequence[Dict[str, Any]],
     try_except_blocks: Optional[Sequence[Dict[str, Any]]] = None,
+    loops: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, List[Case]]:
     """
     Build normal and exception candidate input tuples.
@@ -489,12 +660,23 @@ def build_candidate_cases(
     if smoke not in normal:
         normal.insert(0, smoke)
 
+    loop_cases = _loop_collection_cases(
+        args,
+        branches,
+        list(loops or []),
+        try_except_blocks,
+        smoke,
+    )
+    normal.extend(loop_cases["normal"])
+
     exception_cases: List[Case] = []
     for index, strategy in enumerate(strategies):
         for raise_value in strategy.get("raise") or []:
             case = list(smoke)
             case[index] = raise_value
             exception_cases.append(case)
+
+    exception_cases.extend(loop_cases["exception"])
 
     return {
         "normal": _dedupe_cases(normal),
@@ -651,7 +833,12 @@ def plan_whitebox_cases(
     normal_objectives = [obj for obj in objectives if obj.get("kind") != "exception"]
     exception_objectives = [obj for obj in objectives if obj.get("kind") == "exception"]
 
-    candidates = build_candidate_cases(args, func.get("branches") or [], try_except_blocks)
+    candidates = build_candidate_cases(
+        args,
+        func.get("branches") or [],
+        try_except_blocks,
+        func.get("loops") or [],
+    )
     normal_candidates = candidates["normal"]
     exception_candidates = candidates["exception"]
 

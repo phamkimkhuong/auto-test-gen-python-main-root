@@ -669,6 +669,20 @@ def exception_trigger_values(
 # MAIN STRATEGY ENGINE
 # ============================================================================
 
+def _would_trigger_raise(value: Any, constraints: List[Dict[str, Any]]) -> bool:
+    """Return True when a candidate value satisfies a known raise path."""
+    for constraint in constraints:
+        raise_when = constraint.get("raise_when")
+        if raise_when not in {"truthy", "falsy"}:
+            continue
+        matches = _matches_constraint(value, constraint)
+        if raise_when == "truthy" and matches:
+            return True
+        if raise_when == "falsy" and not matches:
+            return True
+    return False
+
+
 def _classify_boundary_values(
     bounds: List[Any],
     constraint: Dict[str, Any],
@@ -753,7 +767,15 @@ def build_arg_strategy(
         combined_safe.insert(0, default)
 
     boundary_raise = _dedupe(boundary_raise)
-    combined_safe = [value for value in combined_safe if value not in boundary_raise]
+    unsafe_fallback_values = [
+        value for value in combined_safe
+        if value not in boundary_raise and _would_trigger_raise(value, constraints)
+    ]
+    boundary_raise = _dedupe(boundary_raise + unsafe_fallback_values)
+    combined_safe = [
+        value for value in combined_safe
+        if value not in boundary_raise and not _would_trigger_raise(value, constraints)
+    ]
     if not combined_safe:
         combined_safe = type_values or semantic_values or [None]
 
