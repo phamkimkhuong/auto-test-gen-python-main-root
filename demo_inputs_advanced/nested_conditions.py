@@ -1,21 +1,22 @@
-def shipping_fee(weight: float, express: bool, distance: int) -> int:
+# logic tính phí vận chuyển với nhiều tầng điều kiện:
+# cân nặng, giao nhanh, khoảng cách, exception path.
+def calculate_shipping_fee(weight, express, distance_km):
     if weight <= 0:
         raise ValueError("weight must be positive")
 
-    if distance < 0:
-        raise ValueError("distance must be non-negative")
+    if distance_km <= 0:
+        raise ValueError("distance must be positive")
 
     if weight <= 1:
         if express:
-            if distance > 100:
-                return 50
+            if distance_km > 20:
+                return 35
             return 30
         return 15
 
     if weight <= 5:
+        if express:
+            return 55
         return 40
 
-    if distance > 100:
-        return 95
-
-    return 70
+    return 80

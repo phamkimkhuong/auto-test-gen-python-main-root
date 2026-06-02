@@ -217,6 +217,114 @@ def _condition_matches(branch: Dict[str, Any], values: Dict[str, Any]) -> bool:
     return False
 
 
+def _branch_has_interrupt(branch: Dict[str, Any], kind: Optional[str] = None) -> bool:
+    """Detect simple branch-body control-flow interrupts from parser metadata/source."""
+    segment = branch.get("source_segment") or ""
+    has_continue = "continue" in segment
+    has_break = "break" in segment
+    has_return = bool(branch.get("body_returns")) or "return" in segment
+    has_raise = bool(branch.get("has_body_raise")) or "raise " in segment
+    if kind == "continue":
+        return has_continue
+    if kind == "break":
+        return has_break
+    if kind == "return":
+        return has_return
+    if kind == "raise":
+        return has_raise
+    return has_continue or has_break or has_return or has_raise
+
+
+def _previous_same_scope_guard_blocks(
+    func: Dict[str, Any],
+    branch: Dict[str, Any],
+    values: Dict[str, Any],
+    *,
+    seen: Optional[Set[Any]] = None,
+) -> bool:
+    """Return True if an earlier sibling guard prevents this branch from running."""
+    branch_index = branch.get("branch_index")
+    for previous in func.get("branches") or []:
+        if previous.get("branch_index") == branch_index:
+            return False
+        if not _same_branch_scope(previous, branch):
+            continue
+        if not _branch_has_interrupt(previous):
+            continue
+        if not _branch_gates_satisfied(func, previous, values, seen=seen):
+            continue
+        if _condition_matches(previous, values):
+            return True
+    return False
+
+
+def _loop_branches_for_context(func: Dict[str, Any], loop: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return branches syntactically placed inside a simple loop body."""
+    start = int(loop.get("lineno", 0) or 0)
+    end = int(loop.get("end_lineno", start) or start)
+    branches = [
+        branch for branch in (func.get("branches") or [])
+        if start < int(branch.get("lineno", 0) or 0) <= end
+    ]
+    return sorted(branches, key=lambda b: int(b.get("lineno", 0) or 0))
+
+
+def _loop_branch_outcomes(
+    func: Dict[str, Any],
+    branch: Dict[str, Any],
+    values: Dict[str, Any],
+    loop: Dict[str, Any],
+) -> Tuple[bool, bool, bool]:
+    """Simulate reachability of a branch inside a simple for-loop.
+
+    This keeps branch coverage realistic for patterns such as:
+        if item < 0: continue
+        if item > 100: break
+        if item >= 50: ...
+    """
+    iter_name = loop.get("iter")
+    target = loop.get("target")
+    iterable = values.get(iter_name)
+    if not isinstance(iterable, (list, tuple, set)):
+        return False, False, False
+
+    branch_id = branch.get("branch_index")
+    loop_branches = _loop_branches_for_context(func, loop)
+    outcomes: List[bool] = []
+
+    stop_loop = False
+    for item in iterable:
+        if stop_loop:
+            break
+        local_values = dict(values)
+        local_values[str(target)] = item
+
+        for current in loop_branches:
+            current_id = current.get("branch_index")
+            matched = _condition_matches(current, local_values)
+
+            if current_id == branch_id:
+                outcomes.append(matched)
+
+            if matched:
+                if _branch_has_interrupt(current, "continue"):
+                    break
+                if (
+                    _branch_has_interrupt(current, "break")
+                    or _branch_has_interrupt(current, "return")
+                    or _branch_has_interrupt(current, "raise")
+                ):
+                    stop_loop = True
+                    break
+
+            if current_id == branch_id:
+                break
+
+    if not outcomes:
+        return False, False, False
+    return any(outcomes), any(not result for result in outcomes), True
+
+
 def _loop_for_branch(func: Dict[str, Any], branch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Return a simple for-loop context when a branch uses the loop target."""
     source = branch.get("source") or ""
@@ -247,35 +355,21 @@ def _branch_outcomes(
     Return (can_true, can_false, executed) for a branch under one input case.
 
     For ordinary branches, there is one condition evaluation. For a simple
-    branch inside `for item in items`, the same input case may cover both true
-    and false edges if the collection contains values of both kinds.
+    branch inside `for item in items`, this function simulates common loop
+    control-flow (`continue`, `break`, `return`, `raise`) so later branches are
+    not incorrectly considered executed after an earlier interrupt.
     """
     if not _branch_gates_satisfied(func, branch, values, seen=seen):
         return False, False, False
+    if _previous_same_scope_guard_blocks(func, branch, values, seen=seen):
+        return False, False, False
 
     loop = _loop_for_branch(func, branch)
-    if not loop:
-        matched = _condition_matches(branch, values)
-        return matched, not matched, True
+    if loop:
+        return _loop_branch_outcomes(func, branch, values, loop)
 
-    iter_name = loop.get("iter")
-    target = loop.get("target")
-    iterable = values.get(iter_name)
-    if not isinstance(iterable, (list, tuple, set)):
-        return False, False, False
-
-    outcomes: List[bool] = []
-    for item in iterable:
-        local_values = dict(values)
-        local_values[str(target)] = item
-        outcomes.append(_condition_matches(branch, local_values))
-
-    if not outcomes:
-        # Empty loop executes no inner if. It may still help statement coverage
-        # for the function, but it does not cover either branch edge.
-        return False, False, False
-
-    return any(outcomes), any(not result for result in outcomes), True
+    matched = _condition_matches(branch, values)
+    return matched, not matched, True
 
 
 # ============================================================================
@@ -488,6 +582,19 @@ def build_whitebox_objectives(func: Dict[str, Any]) -> List[Objective]:
                 "source": "fallthrough/default",
                 "lineno": last.get("lineno"),
                 "description": "Execute fallthrough/default path where all conditions in the chain are false.",
+            })
+
+    # A for-loop itself has an entry/exit decision. Add a lightweight objective
+    # for the zero-iteration path so branch coverage includes the loop exit edge
+    # (for example `for item in items` with `items=[]`).
+    for loop in func.get("loops") or []:
+        if loop.get("type") in {"for", "async_for"} and loop.get("iter"):
+            objectives.append({
+                "id": _objective_id(["loop_empty", loop.get("lineno"), loop.get("iter")]),
+                "kind": "loop_empty",
+                "lineno": loop.get("lineno"),
+                "iter": loop.get("iter"),
+                "description": "Execute zero-iteration loop path.",
             })
 
     # Unconditional raise is not branch-specific, but it is still an exception
@@ -734,6 +841,11 @@ def evaluate_case_objectives(
             if group_index is not None and group_index < len(groups):
                 if _group_reaches_default(func, groups[group_index], values):
                     covered.add(oid)
+
+        elif kind == "loop_empty":
+            iter_name = objective.get("iter")
+            if iter_name in values and values.get(iter_name) == []:
+                covered.add(oid)
 
         elif kind == "exception" and allow_exception:
             if objective.get("branch_index") is None:

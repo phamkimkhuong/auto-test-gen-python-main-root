@@ -1,14 +1,16 @@
-def can_checkout(age: int, verified: bool, total: float, banned: bool) -> str:
+# nhiều điều kiện logic
+# Tổ hợp and, or, biến trạng thái như verified, banned, priority, age, total.
+def evaluate_promotion_eligibility(age, verified, banned, total, priority):
+    if age < 18:
+        return "underage"
+
     if banned:
         return "blocked"
 
-    if age >= 18 and verified and total >= 100:
-        return "priority"
+    if verified and (total >= 500 or priority):
+        return "premium"
 
-    if age >= 18 and verified and total > 0:
-        return "allowed"
+    if verified or total >= 200:
+        return "standard"
 
-    if age < 18 or total <= 0:
-        return "blocked"
-
-    return "pending"
+    return "limited"

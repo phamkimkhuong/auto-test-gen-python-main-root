@@ -1,14 +1,16 @@
-def count_passed(scores: list[int]) -> int:
-    count = 0
+# vòng lặp có nhiều nhánh
+# vòng lặp duyệt danh sách điểm, có branch score < 0, score >= 80, score >= 50, và nhánh còn lại.
+def count_valid_scores(scores):
+    passed = 0
 
     for score in scores:
         if score < 0:
-            raise ValueError("score must be non-negative")
+            continue
 
-        if score >= 80:
-            count += 2
+        if score > 100:
+            break
 
         if score >= 50:
-            count += 1
+            passed += 1
 
-    return count
+    return passed

@@ -191,6 +191,12 @@ def _branch_gates_satisfied(
             return False
         if not _branch_gates_satisfied(gate_branch, input_values, lookup, seen):
             return False
+        ordered_branches = sorted(
+            lookup.values(),
+            key=lambda b: int(b.get("branch_index", 0) or 0),
+        )
+        if _blocked_by_previous_same_scope_guard(gate_branch, ordered_branches, input_values, lookup):
+            return False
         matched = evaluate_condition(gate_branch.get("condition") or {}, input_values)
         if gate.get("side") == "truthy" and not matched:
             return False
