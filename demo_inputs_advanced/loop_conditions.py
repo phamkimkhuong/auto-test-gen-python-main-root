@@ -5,6 +5,9 @@ def count_passed(scores: list[int]) -> int:
         if score < 0:
             raise ValueError("score must be non-negative")
 
+        if score >= 80:
+            count += 2
+
         if score >= 50:
             count += 1
 
